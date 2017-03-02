@@ -20,13 +20,15 @@ module Fluent::Plugin
     config_set_default :include_time_key, true
 
     desc "MongoDB database"
-    config_param :database, :string
+    config_param :database, :string, default: ''
     desc "MongoDB collection"
     config_param :collection, :string, default: 'untagged'
     desc "MongoDB host"
     config_param :host, :string, default: 'localhost'
     desc "MongoDB port"
     config_param :port, :integer, default: 27017
+    desc "MongoDB connection string"
+    config_param :connection_string, :string, default: ''
     desc "MongoDB write_concern"
     config_param :write_concern, :integer, default: nil
     desc "MongoDB journaled"
@@ -35,6 +37,12 @@ module Fluent::Plugin
     config_param :replace_dot_in_key_with, :string, default: nil
     desc "Replace dollar with specified string"
     config_param :replace_dollar_in_key_with, :string, default: nil
+
+    # upsert options
+    desc "Try to upsert documents with _id field"
+    config_param :try_to_upsert, :bool, default: false
+    desc "Key to use for upsert"
+    config_param :key_for_upsert, :string, default: '_id'
 
     # tag mapping mode
     desc "Use tag_mapped mode"
@@ -104,6 +112,10 @@ module Fluent::Plugin
       end
       raise Fluent::ConfigError, "normal mode requires collection parameter" if !@tag_mapped and !conf.has_key?('collection')
 
+      if @connection_string == '' and @database == ''
+        raise Fluent::ConfigError, "database parameter is required"
+      end
+
       if conf.has_key?('capped')
         raise Fluent::ConfigError, "'capped_size' parameter is required on <store> of Mongo output" unless conf.has_key?('capped_size')
         @collection_options[:capped] = true
@@ -171,10 +183,14 @@ module Fluent::Plugin
     private
 
     def client
-      @client_options[:database] = @database
-      @client_options[:user] = @user if @user
-      @client_options[:password] = @password if @password
-      Mongo::Client.new(["#{@host}:#{@port}"], @client_options)
+      if @connection_string
+        Mongo::Client.new(@connection_string)
+      else
+        @client_options[:database] = @database
+        @client_options[:user] = @user if @user
+        @client_options[:password] = @password if @password
+        Mongo::Client.new(["#{@host}:#{@port}"], @client_options)
+      end
     end
 
     def collect_records(chunk)
@@ -213,7 +229,25 @@ module Fluent::Plugin
           end
         end
 
-        @client[collection, @collection_options].insert_many(records)
+        if @try_to_upsert
+          records_without_key = []
+          records.map! do |r|
+            if r[@key_for_upsert]
+              @client[collection, @collection_options].update_one(
+                {@key_for_upsert => r[@key_for_upsert]},
+                {"$set" => r},
+                {:upsert => true}
+              )
+            else
+              records_without_key << r
+            end
+          end
+          if records_without_key.size
+            @client[collection, @collection_options].insert_many(records_without_key)
+          end
+        else
+         @client[collection, @collection_options].insert_many(records)
+        end
       rescue Mongo::Error::BulkWriteError => e
         log.warn "#{records.size - e.result["n_inserted"]} documents are not inserted. Maybe these documents are invalid as a BSON."
       rescue ArgumentError => e
